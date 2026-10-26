@@ -1,0 +1,47 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs and temporary files
+*.log
+*.tmp
+.cache/
+.pycache/
+
+# Original evidence and generated reports
+evidence_vault/
+evidence/
+reports/*
+!reports/README.md
+audit_log.jsonl
+
+# Generated video/frame caches
+frame_cache/
+thumbnail_cache/
+*.part
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
