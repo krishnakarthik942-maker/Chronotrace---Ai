@@ -250,6 +250,7 @@ def load_demo_dataset():
             TimeAnchorPoint("ANCHOR-DEMO-04", "cam_3", source_time_sec=8.0, reference_time_sec=6.0),
         ])
 
+        st.session_state.last_exported_files = None
     st.success("Successfully loaded 3-camera Forensic Hit-and-Run Case!")
     st.rerun()
 
@@ -293,23 +294,41 @@ with st.sidebar:
                 em: EvidenceManager = st.session_state.evidence_manager
                 extractor = VideoMetadataExtractor()
                 detector = EventDetector(cache_dir=CACHE_DIR / "events")
+                matcher = VisualMatcher()
+
+                ingested_records = []
+                upload_errors = []
 
                 for idx, uf in enumerate(uploaded_files):
-                    cam_id = f"cam_{idx+1}"
-                    cam_name = f"Camera {idx+1} ({uf.name})"
+                    cam_id = f"cam_{len(st.session_state.metadata) + idx + 1}"
+                    cam_name = f"Camera {len(st.session_state.metadata) + idx + 1} ({uf.name})"
 
-                    # Save temp copy
-                    temp_path = CACHE_DIR / uf.name
-                    temp_path.write_bytes(uf.getbuffer())
+                    rec, err_msg = em.safe_ingest_uploaded_stream(
+                        file_name=uf.name,
+                        file_bytes=uf.getbuffer().tobytes(),
+                        camera_name=cam_name,
+                        temp_dir=CACHE_DIR / "temp",
+                        validate_decodable=True,
+                        operator=examiner
+                    )
 
-                    rec = em.register_evidence_file(temp_path, camera_name=cam_name)
+                    if err_msg or not rec:
+                        upload_errors.append(f"{uf.name}: {err_msg}")
+                        continue
+
                     meta = extractor.extract(
                         rec.stored_path,
                         camera_name=cam_name,
                         video_id=cam_id,
                         sha256_hash=rec.sha256_hash
                     )
+
+                    if not meta.is_valid:
+                        upload_errors.append(f"{uf.name}: Video decoding failed - {meta.error_message}")
+                        continue
+
                     st.session_state.metadata[cam_id] = meta
+                    ingested_records.append(rec)
 
                     evs = detector.detect_events(
                         meta.file_path,
@@ -322,7 +341,24 @@ with st.sidebar:
                 if not st.session_state.reference_camera_id and st.session_state.metadata:
                     st.session_state.reference_camera_id = list(st.session_state.metadata.keys())[0]
 
-            st.success(f"Ingested {len(uploaded_files)} video streams!")
+                # Connect cross-camera visual matching across all uploaded streams
+                cam_ids = list(st.session_state.metadata.keys())
+                new_matches = []
+                for i in range(len(cam_ids)):
+                    for j in range(i + 1, len(cam_ids)):
+                        c_a, c_b = cam_ids[i], cam_ids[j]
+                        ev_a = [e for e in st.session_state.events if e.camera_id == c_a]
+                        ev_b = [e for e in st.session_state.events if e.camera_id == c_b]
+                        matches = matcher.match_events(ev_a, ev_b)
+                        new_matches.extend(matches)
+                st.session_state.candidate_matches = new_matches
+                st.session_state.last_exported_files = None
+
+            if upload_errors:
+                for err in upload_errors:
+                    st.error(f"❌ {err}")
+            if ingested_records:
+                st.success(f"Ingested {len(ingested_records)} streams and generated {len(st.session_state.candidate_matches)} candidate visual correspondences!")
             st.rerun()
 
     st.markdown("---")
@@ -353,7 +389,10 @@ if st.session_state.metadata:
     aligner = TimeAligner(reference_camera_id=ref_id)
 
     for cam_id, meta in st.session_state.metadata.items():
-        manual_off, manual_r = st.session_state.manual_offsets.get(cam_id, (None, None))
+        m_val = st.session_state.manual_offsets.get(cam_id, (None, None))
+        manual_off = m_val[0]
+        manual_r = m_val[1]
+        manual_reason = m_val[2] if len(m_val) > 2 else "Examiner manual calibration"
         res = aligner.align_camera_from_anchors(
             camera_id=cam_id,
             camera_name=meta.camera_name,
@@ -362,6 +401,9 @@ if st.session_state.metadata:
             manual_offset=manual_off,
             manual_rate=manual_r
         )
+        if manual_off is not None:
+            res.override_reason = manual_reason
+            res.derivation_label = "EXAMINER_OVERRIDE"
         alignments[cam_id] = res
 
 
@@ -473,10 +515,12 @@ with tab_timeline:
     else:
         tb = TimelineBuilder(metadata_dict=st.session_state.metadata, alignments=alignments)
         spans = tb.compute_camera_spans()
+        confirmed_matches = [m for m in st.session_state.candidate_matches if m.review_status in ("CONFIRMED", "CONFIRMED_BY_USER") or m.is_anchor]
+        unverified_candidates = [m for m in st.session_state.candidate_matches if m.review_status == "CANDIDATE_UNVERIFIED"]
         unified_events = tb.build_unified_events(
             st.session_state.events,
-            st.session_state.candidate_matches,
-            st.session_state.candidate_matches
+            confirmed_matches,
+            unverified_candidates
         )
 
         st.subheader("Interactive Forensic Multi-Track Timeline")
@@ -571,7 +615,30 @@ with tab_matches:
     """)
 
     if not st.session_state.candidate_matches:
-        st.info("No cross-camera candidate matches generated yet. Load the demo dataset or ingest videos.")
+        if len(st.session_state.metadata) >= 2:
+            st.info(
+                f"Detected visual events did not produce any candidate matches meeting the similarity thresholds "
+                f"(pHash dist <= 24, similarity >= 0.65). "
+                "CCTV viewpoints may not share visual overlap, or events occurred outside the field of view. "
+                "You can enter verified timing anchors manually in Tab 4, or click below to re-run candidate matching."
+            )
+            if st.button("🔍 Search Cross-Camera Candidate Matches"):
+                with st.spinner("Analyzing cross-camera visual feature descriptors..."):
+                    matcher = VisualMatcher()
+                    cam_ids = list(st.session_state.metadata.keys())
+                    new_matches = []
+                    for i in range(len(cam_ids)):
+                        for j in range(i + 1, len(cam_ids)):
+                            c_a, c_b = cam_ids[i], cam_ids[j]
+                            ev_a = [e for e in st.session_state.events if e.camera_id == c_a]
+                            ev_b = [e for e in st.session_state.events if e.camera_id == c_b]
+                            matches = matcher.match_events(ev_a, ev_b)
+                            new_matches.extend(matches)
+                    st.session_state.candidate_matches = new_matches
+                    st.success(f"Generated {len(new_matches)} candidate correspondences!")
+                    st.rerun()
+        else:
+            st.info("No cross-camera candidate matches generated yet. Load the demo dataset or upload at least 2 video streams to begin.")
     else:
         for idx, m in enumerate(st.session_state.candidate_matches):
             with st.container():
@@ -599,23 +666,57 @@ with tab_matches:
                 with col_act:
                     st.markdown(f"**Status:** `{m.review_status}`")
                     if st.button(f"✓ Confirm as Anchor", key=f"confirm_{idx}"):
-                        m.review_status = "CONFIRMED_BY_USER"
-                        m.is_anchor = True
-                        # Add to confirmed anchors
-                        st.session_state.confirmed_anchors.append(
-                            TimeAnchorPoint(
-                                match_id=m.match_id,
-                                camera_id=m.camera_b_id,
-                                source_time_sec=m.time_b_sec,
-                                reference_time_sec=m.time_a_sec
+                        ref_id = st.session_state.reference_camera_id or (list(st.session_state.metadata.keys())[0] if st.session_state.metadata else "")
+                        anchor, msg = TimeAligner.resolve_anchor_from_match(m, ref_id, alignments)
+                        if anchor is not None:
+                            m.review_status = "CONFIRMED_BY_USER"
+                            m.is_anchor = True
+                            st.session_state.confirmed_anchors = [
+                                a for a in st.session_state.confirmed_anchors
+                                if a.match_id not in (m.match_id, f"{m.match_id}-transitive", anchor.match_id)
+                            ]
+                            st.session_state.confirmed_anchors.append(anchor)
+                            st.session_state.evidence_manager.record_audit(
+                                action="ANCHOR_CONFIRMED",
+                                details={
+                                    "match_id": m.match_id,
+                                    "target_camera": anchor.camera_id,
+                                    "source_time": anchor.source_time_sec,
+                                    "reference_time": anchor.reference_time_sec,
+                                    "reason": f"Confirmed correspondence between {m.camera_a_name} and {m.camera_b_name}: {msg}"
+                                },
+                                operator=examiner
                             )
-                        )
-                        st.success("Anchor confirmed!")
-                        st.rerun()
+                            st.session_state.last_exported_files = None
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                            st.session_state.evidence_manager.record_audit(
+                                action="ANCHOR_CONFIRMATION_REJECTED",
+                                details={
+                                    "match_id": m.match_id,
+                                    "reason": msg
+                                },
+                                operator=examiner
+                            )
 
                     if st.button(f"✗ Reject Candidate", key=f"reject_{idx}"):
                         m.review_status = "REJECTED_BY_USER"
                         m.is_anchor = False
+                        st.session_state.confirmed_anchors = [
+                            a for a in st.session_state.confirmed_anchors
+                            if a.match_id not in (m.match_id, f"{m.match_id}-transitive")
+                        ]
+                        st.session_state.evidence_manager.record_audit(
+                            action="CANDIDATE_REJECTED",
+                            details={
+                                "match_id": m.match_id,
+                                "reason": f"Examiner rejected suggested candidate match between {m.camera_a_name} and {m.camera_b_name}"
+                            },
+                            operator=examiner
+                        )
+                        st.session_state.last_exported_files = None
                         st.rerun()
 
 
@@ -653,19 +754,33 @@ with tab_manual:
                 help="Nominal is 1.000000. E.g. 1.001 represents 1000 ppm drift."
             )
 
+            override_reason = st.text_input(
+                "Forensic Reason / Justification",
+                value="Examiner calibration based on corroborated timing event",
+                help="Reason for manual override (recorded in immutable audit log)"
+            )
+
             col_btn1, col_btn2 = st.columns(2)
             with col_btn1:
                 if st.button("Apply Manual Calibration", use_container_width=True):
-                    st.session_state.manual_offsets[target_cam] = (new_offset, new_rate)
+                    st.session_state.manual_offsets[target_cam] = (new_offset, new_rate, override_reason)
                     st.session_state.evidence_manager.record_audit(
                         action="MANUAL_OFFSET_APPLIED",
-                        details={"camera_id": target_cam, "offset": new_offset, "rate": new_rate}
+                        details={"camera_id": target_cam, "offset": new_offset, "rate": new_rate, "reason": override_reason},
+                        operator=examiner
                     )
+                    st.session_state.last_exported_files = None
                     st.success(f"Applied manual calibration to {target_cam}")
                     st.rerun()
             with col_btn2:
                 if st.button("Reset to Algorithmic", use_container_width=True):
                     st.session_state.manual_offsets.pop(target_cam, None)
+                    st.session_state.evidence_manager.record_audit(
+                        action="MANUAL_OFFSET_RESET",
+                        details={"camera_id": target_cam, "reason": "Examiner reset camera alignment to algorithmic RANSAC calibration"},
+                        operator=examiner
+                    )
+                    st.session_state.last_exported_files = None
                     st.success(f"Reset {target_cam} to RANSAC calibration")
                     st.rerun()
 
@@ -697,8 +812,10 @@ with tab_manual:
                 )
                 st.session_state.evidence_manager.record_audit(
                     action="VERIFIED_ANCHOR_ADDED",
-                    details={"anchor_id": new_a_id, "camera_id": anchor_cam, "src_time": src_time, "ref_time": ref_time}
+                    details={"anchor_id": new_a_id, "camera_id": anchor_cam, "src_time": src_time, "ref_time": ref_time, "reason": anchor_note},
+                    operator=examiner
                 )
+                st.session_state.last_exported_files = None
                 st.success(f"Added anchor {new_a_id}!")
                 st.rerun()
 
@@ -709,28 +826,47 @@ with tab_manual:
 with tab_reports:
     st.subheader("Court-Admissible Forensic Data Package Export")
     st.markdown("""
-    Generates all four standard digital forensic packages with cryptographic validation:
+    Generates all five standard digital forensic packages with cryptographic validation:
     1. `unified_timeline.csv` — Unified timeline with uncertainty bounds and derived flags.
-    2. `event_matches.csv` — Corroborated cross-camera candidate and anchor matches.
-    3. `synchronization_report.json` — Calibration formulas, RANSAC inliers/outliers, and limitations disclosures.
-    4. `evidence_manifest.json` — Cryptographic SHA-256 catalog and append-only audit trail.
+    2. `unified_timeline.json` — Structured JSON timeline with complete provenance.
+    3. `event_matches.csv` — Corroborated cross-camera candidate and anchor matches.
+    4. `synchronization_report.json` — Calibration formulas, RANSAC inliers/outliers, and limitations disclosures.
+    5. `evidence_manifest.json` — Cryptographic SHA-256 catalog and append-only audit trail.
     """)
 
     if not st.session_state.metadata:
         st.info("No data available to export.")
     else:
         tb = TimelineBuilder(metadata_dict=st.session_state.metadata, alignments=alignments)
+        confirmed_matches = [m for m in st.session_state.candidate_matches if m.review_status in ("CONFIRMED", "CONFIRMED_BY_USER") or m.is_anchor]
+        unverified_candidates = [m for m in st.session_state.candidate_matches if m.review_status == "CANDIDATE_UNVERIFIED"]
         unified_events = tb.build_unified_events(
             st.session_state.events,
-            st.session_state.candidate_matches,
-            st.session_state.candidate_matches
+            confirmed_matches,
+            unverified_candidates
         )
 
         exporter = ForensicReportExporter(reports_dir=REPORTS_DIR)
 
+        em: EvidenceManager = st.session_state.evidence_manager
+        is_audit_intact, audit_status_msg = em.verify_audit_log_integrity()
+
+        st.markdown(f"""
+        <div class="forensic-card" style="margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 700; color: #f8fafc;">Cryptographic Audit Log Verification</span>
+                <span style="color: {'#34d399' if is_audit_intact else '#f87171'}; font-weight: 700;">
+                    {'✓ HASH-CHAIN VERIFIED INTACT' if is_audit_intact else '⚠️ HASH-CHAIN INTEGRITY COMPROMISED'}
+                </span>
+            </div>
+            <div style="color: #94a3b8; font-size: 12px; margin-top: 4px;">
+                {audit_status_msg}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
         if st.button("📦 Generate Complete Forensic Report Package", type="primary", use_container_width=True):
             with st.spinner("Compiling cryptographic manifests and reports..."):
-                em: EvidenceManager = st.session_state.evidence_manager
                 paths = exporter.export_all(
                     unified_events=unified_events,
                     matches=st.session_state.candidate_matches,
@@ -742,6 +878,16 @@ with tab_reports:
                     investigator_name=examiner
                 )
                 st.session_state.last_exported_files = paths
+                em.record_audit(
+                    action="FORENSIC_REPORTS_EXPORTED",
+                    details={
+                        "case_id": case_id,
+                        "exported_artifacts": list(paths.keys()),
+                        "total_events": len(unified_events),
+                        "reason": f"Official forensic package generated by examiner {examiner}"
+                    },
+                    operator=examiner
+                )
                 st.success("Successfully generated all forensic artifacts!")
 
         if st.session_state.last_exported_files:
@@ -749,7 +895,7 @@ with tab_reports:
             col_d1, col_d2 = st.columns(2)
 
             with col_d1:
-                p_csv = Path(st.session_state.last_exported_files["unified_timeline_csv"])
+                p_csv = Path(st.session_state.last_exported_files.get("unified_timeline_csv", ""))
                 if p_csv.is_file():
                     st.download_button(
                         label="📥 Download unified_timeline.csv",
@@ -759,7 +905,17 @@ with tab_reports:
                         use_container_width=True
                     )
 
-                p_matches = Path(st.session_state.last_exported_files["event_matches_csv"])
+                p_json = Path(st.session_state.last_exported_files.get("unified_timeline_json", ""))
+                if p_json.is_file():
+                    st.download_button(
+                        label="📥 Download unified_timeline.json",
+                        data=p_json.read_text(encoding="utf-8"),
+                        file_name="unified_timeline.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+
+                p_matches = Path(st.session_state.last_exported_files.get("event_matches_csv", ""))
                 if p_matches.is_file():
                     st.download_button(
                         label="📥 Download event_matches.csv",
@@ -770,7 +926,7 @@ with tab_reports:
                     )
 
             with col_d2:
-                p_sync = Path(st.session_state.last_exported_files["synchronization_report_json"])
+                p_sync = Path(st.session_state.last_exported_files.get("synchronization_report_json", ""))
                 if p_sync.is_file():
                     st.download_button(
                         label="📥 Download synchronization_report.json",
@@ -780,7 +936,7 @@ with tab_reports:
                         use_container_width=True
                     )
 
-                p_man = Path(st.session_state.last_exported_files["evidence_manifest_json"])
+                p_man = Path(st.session_state.last_exported_files.get("evidence_manifest_json", ""))
                 if p_man.is_file():
                     st.download_button(
                         label="📥 Download evidence_manifest.json",

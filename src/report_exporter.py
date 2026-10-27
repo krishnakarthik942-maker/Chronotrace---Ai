@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.evidence_integrity import EvidenceManager, EvidenceRecord, SOFTWARE_VERSION
-from src.time_aligner import CameraAlignmentResult
+from src.time_aligner import CameraAlignmentResult, FORENSIC_STATUS_CRITERIA
 from src.timeline_builder import UnifiedTimelineEvent
 from src.video_metadata import VideoMetadata
 from src.visual_matcher import CandidateMatch
@@ -63,9 +64,10 @@ class ForensicReportExporter:
         case_id: str = "CASE-2026-CHRONOTRACE",
         investigator_name: str = "Forensic Examiner"
     ) -> Dict[str, str]:
-        """Export all 4 mandatory forensic artifacts."""
+        """Export all mandatory forensic artifacts."""
 
         timeline_csv = self.export_unified_timeline_csv(unified_events)
+        timeline_json = self.export_unified_timeline_json(unified_events, case_id, investigator_name)
         matches_csv = self.export_event_matches_csv(matches)
         sync_json = self.export_synchronization_report_json(
             alignments, metadata, matches, case_id, investigator_name
@@ -76,6 +78,7 @@ class ForensicReportExporter:
 
         return {
             "unified_timeline_csv": str(timeline_csv.resolve()),
+            "unified_timeline_json": str(timeline_json.resolve()),
             "event_matches_csv": str(matches_csv.resolve()),
             "synchronization_report_json": str(sync_json.resolve()),
             "evidence_manifest_json": str(manifest_json.resolve())
@@ -86,8 +89,9 @@ class ForensicReportExporter:
         events: List[UnifiedTimelineEvent],
         filename: str = "unified_timeline.csv"
     ) -> Path:
-        """Export unified_timeline.csv containing all forensic events."""
+        """Export unified_timeline.csv containing all forensic events with provenance."""
         out_path = self.reports_dir / filename
+        now_utc = datetime.now(timezone.utc).isoformat()
         fieldnames = [
             "event_id",
             "camera_id",
@@ -103,7 +107,14 @@ class ForensicReportExporter:
             "review_status",
             "uncertainty_sec",
             "data_classification",
-            "notes"
+            "notes",
+            "calibration_method",
+            "synchronization_status",
+            "supporting_anchors",
+            "override_reason",
+            "audit_ref",
+            "software_version",
+            "export_timestamp_utc"
         ]
 
         with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -117,6 +128,8 @@ class ForensicReportExporter:
 
                 corr_str = f"{ev.corrected_timestamp_sec:.4f}" if ev.corrected_timestamp_sec is not None else "UNALIGNED"
                 unc_str = f"{ev.uncertainty_sec:.4f}" if ev.uncertainty_sec is not None else "UNKNOWN"
+                conf_str = f"{ev.confidence:.3f}" if ev.confidence is not None else "NONE"
+                anchors_str = ";".join(ev.supporting_anchors) if getattr(ev, "supporting_anchors", None) else "NONE"
 
                 writer.writerow({
                     "event_id": ev.event_id,
@@ -129,12 +142,73 @@ class ForensicReportExporter:
                     "event_type": ev.event_type,
                     "visual_category": ev.visual_category,
                     "matching_evidence": matching_ev,
-                    "confidence": f"{ev.confidence:.3f}",
+                    "confidence": conf_str,
                     "review_status": ev.review_status,
                     "uncertainty_sec": unc_str,
-                    "data_classification": "DERIVED_RESULT",
-                    "notes": ev.notes
+                    "data_classification": getattr(ev, "data_classification", "DERIVED_RESULT"),
+                    "notes": ev.notes,
+                    "calibration_method": getattr(ev, "calibration_method", None) or "NONE",
+                    "synchronization_status": getattr(ev, "synchronization_status", None) or "UNALIGNED",
+                    "supporting_anchors": anchors_str,
+                    "override_reason": getattr(ev, "override_reason", None) or "N/A",
+                    "audit_ref": getattr(ev, "audit_ref", None) or "N/A",
+                    "software_version": SOFTWARE_VERSION,
+                    "export_timestamp_utc": now_utc
                 })
+
+        return out_path
+
+    def export_unified_timeline_json(
+        self,
+        events: List[UnifiedTimelineEvent],
+        case_id: str = "CASE-2026-CHRONOTRACE",
+        investigator_name: str = "Forensic Examiner",
+        filename: str = "unified_timeline.json"
+    ) -> Path:
+        """Export structured unified_timeline.json containing all forensic events and full provenance."""
+        out_path = self.reports_dir / filename
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        serialized_events = []
+        for ev in events:
+            serialized_events.append({
+                "event_id": ev.event_id,
+                "camera_id": ev.camera_id,
+                "camera_name": ev.camera_name,
+                "source_filename": ev.source_filename,
+                "frame_number": ev.frame_number,
+                "source_timestamp_sec": ev.source_timestamp_sec,
+                "corrected_timestamp_sec": ev.corrected_timestamp_sec,
+                "event_type": ev.event_type,
+                "visual_category": ev.visual_category,
+                "matched_with_camera": ev.matched_with_camera,
+                "matched_event_id": ev.matched_event_id,
+                "confidence": ev.confidence,
+                "review_status": ev.review_status,
+                "uncertainty_sec": None if (ev.uncertainty_sec is None or math.isinf(ev.uncertainty_sec)) else ev.uncertainty_sec,
+                "data_classification": getattr(ev, "data_classification", "DERIVED_RESULT"),
+                "calibration_method": getattr(ev, "calibration_method", None),
+                "synchronization_status": getattr(ev, "synchronization_status", "UNALIGNED"),
+                "supporting_anchors": getattr(ev, "supporting_anchors", []),
+                "override_reason": getattr(ev, "override_reason", None),
+                "audit_ref": getattr(ev, "audit_ref", None),
+                "thumbnail_path": ev.thumbnail_path,
+                "notes": ev.notes
+            })
+
+        doc = {
+            "report_type": "FORENSIC_UNIFIED_TIMELINE_REPORT",
+            "software_name": "ChronoTrace AI",
+            "software_version": SOFTWARE_VERSION,
+            "generated_utc": now_utc,
+            "case_id": case_id,
+            "investigator": investigator_name,
+            "total_events": len(serialized_events),
+            "events": serialized_events
+        }
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2)
 
         return out_path
 
@@ -247,12 +321,13 @@ class ForensicReportExporter:
                 "algorithm": "RANSAC Robust Multi-Point Temporal Calibration",
                 "mathematical_model": "T_corrected = offset + rate * t_source",
                 "description": FORENSIC_METHOD_EXPLANATION,
-                "limitations_disclosure": FORENSIC_LIMITATIONS_DISCLOSURE
+                "limitations_disclosure": FORENSIC_LIMITATIONS_DISCLOSURE,
+                "status_criteria": FORENSIC_STATUS_CRITERIA
             },
             "total_cameras": len(metadata),
             "camera_alignments": cameras_report,
             "total_candidate_matches": len(matches),
-            "total_confirmed_anchors": sum(1 for m in matches if m.is_anchor or m.review_status == "CONFIRMED_BY_USER")
+            "total_confirmed_anchors": sum(1 for m in matches if m.is_anchor or m.review_status in ("CONFIRMED", "CONFIRMED_BY_USER"))
         }
 
         with open(out_path, "w", encoding="utf-8") as f:

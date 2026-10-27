@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.pyd
@@ -29,17 +29,32 @@ Thumbs.db
 .cache/
 .pycache/
 
-# Original evidence and generated reports
+# Evidence custody, data vaults, and audit trails
+data/
+data/**
 evidence_vault/
 evidence/
-reports/*
-!reports/README.md
+**/audit_log.jsonl
 audit_log.jsonl
 
-# Generated video/frame caches
+# Generated case reports
+reports/*
+!reports/README.md
+
+# Video media files (prevent accidental commit of video evidence)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.flv
+sample_data/*.mp4
+
+# Generated video/frame caches and temporary uploads
 frame_cache/
 thumbnail_cache/
 *.part
+*.tmp
 
 # Build artifacts
 build/

@@ -33,6 +33,9 @@ class VisualEvent:
     review_status: str = "UNREVIEWED"  # "UNREVIEWED", "CONFIRMED", "REJECTED"
     is_anchor: bool = False
     notes: str = ""
+    data_classification: Optional[str] = None
+    is_inferred: bool = False
+    audit_ref: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

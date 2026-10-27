@@ -11,6 +11,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.evidence_integrity import SOFTWARE_VERSION
 from src.event_detector import VisualEvent
 from src.time_aligner import CameraAlignmentResult
 from src.video_metadata import VideoMetadata
@@ -32,14 +33,25 @@ class UnifiedTimelineEvent:
     visual_category: str  # "VERIFIED_ANCHOR", "SUGGESTED_MATCH", "DETECTED_EVENT", "MANUAL_ADJUSTMENT"
     matched_with_camera: Optional[str] = None
     matched_event_id: Optional[str] = None
-    confidence: float = 1.0
+    confidence: Optional[float] = 1.0
     review_status: str = "UNREVIEWED"  # "CONFIRMED", "REJECTED", "UNREVIEWED"
     uncertainty_sec: Optional[float] = None
     thumbnail_path: Optional[str] = None
     notes: str = ""
+    data_classification: str = "DERIVED_RESULT"
+    calibration_method: Optional[str] = None
+    synchronization_status: Optional[str] = None
+    supporting_anchors: List[str] = field(default_factory=list)
+    override_reason: Optional[str] = None
+    audit_ref: Optional[str] = None
+    software_version: str = SOFTWARE_VERSION
+    export_timestamp_utc: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if d.get("uncertainty_sec") is not None and math.isinf(d["uncertainty_sec"]):
+            d["uncertainty_sec"] = None
+        return d
 
 
 @dataclass
@@ -135,8 +147,9 @@ class TimelineBuilder:
         # Index matches by (camera_id, event_id)
         confirmed_map: Dict[Tuple[str, str], CandidateMatch] = {}
         for m in confirmed_matches:
-            confirmed_map[(m.camera_a_id, m.event_a_id)] = m
-            confirmed_map[(m.camera_b_id, m.event_b_id)] = m
+            if m.is_anchor or m.review_status in ("CONFIRMED", "CONFIRMED_BY_USER"):
+                confirmed_map[(m.camera_a_id, m.event_a_id)] = m
+                confirmed_map[(m.camera_b_id, m.event_b_id)] = m
 
         suggested_map: Dict[Tuple[str, str], CandidateMatch] = {}
         for m in candidate_matches:
@@ -166,8 +179,10 @@ class TimelineBuilder:
                 m = confirmed_map[key]
                 if m.is_anchor:
                     category = "VERIFIED_ANCHOR"
+                elif align and align.status == "MANUAL_OVERRIDE":
+                    category = "VERIFIED_ANCHOR"
                 else:
-                    category = "VERIFIED_ANCHOR" if align and align.status == "MANUAL_OVERRIDE" else "SUGGESTED_MATCH"
+                    category = "CONFIRMED_MATCH"
                 rev_status = "CONFIRMED"
                 conf = m.similarity_score
                 if ev.camera_id == m.camera_a_id:
@@ -192,6 +207,55 @@ class TimelineBuilder:
             else:
                 category = "DETECTED_EVENT"
 
+            # Determine forensic evidentiary classification
+            # Provenance-based classifications:
+            # - MEASURED_FACT: a direct observation from source evidence, with its source identified.
+            # - ALGORITHMIC_ESTIMATE: a calculated or inferred timestamp, match, or calibration.
+            # - EXAMINER_OVERRIDE: a value explicitly changed by an examiner.
+            # Note: Inferred events on the reference camera are ALGORITHMIC_ESTIMATE, not MEASURED_FACT.
+            explicit_classification = getattr(ev, "data_classification", None)
+            is_inferred_event = (
+                explicit_classification == "ALGORITHMIC_ESTIMATE"
+                or getattr(ev, "is_inferred", False)
+                or ev.event_type.lower() in ("inferred", "inferred_event", "interpolated")
+            )
+
+            if explicit_classification == "EXAMINER_OVERRIDE" or (align and align.status == "MANUAL_OVERRIDE") or category == "MANUAL_ADJUSTMENT":
+                classification = "EXAMINER_OVERRIDE"
+            elif explicit_classification == "MEASURED_FACT":
+                classification = "MEASURED_FACT"
+            elif is_inferred_event:
+                classification = "ALGORITHMIC_ESTIMATE"
+            elif align and align.is_reference:
+                classification = "MEASURED_FACT"
+            elif corr_time is not None:
+                classification = "ALGORITHMIC_ESTIMATE"
+            else:
+                classification = "MEASURED_FACT"
+
+            # Provenance fields
+            calib_method = align.method_description if align else "NONE"
+            sync_status = align.status if align else "UNALIGNED"
+
+            supporting_anchors: List[str] = []
+            if align and align.supporting_match_ids:
+                supporting_anchors.extend(align.supporting_match_ids)
+            if key in confirmed_map:
+                supporting_anchors.append(confirmed_map[key].match_id)
+            supporting_anchors = list(dict.fromkeys(supporting_anchors))
+
+            override_reason_val: Optional[str] = None
+            if classification == "EXAMINER_OVERRIDE":
+                override_reason_val = (
+                    getattr(ev, "override_reason", None)
+                    or getattr(align, "override_reason", None)
+                    or (align.forensic_notes if align and align.status == "MANUAL_OVERRIDE" else None)
+                    or "Examiner manual timeline adjustment"
+                )
+
+            audit_ref_val: Optional[str] = getattr(ev, "audit_ref", None) or (getattr(align, "audit_ref", None) if align else None)
+            conf_val = round(conf, 3) if conf is not None else None
+
             uni_evt = UnifiedTimelineEvent(
                 event_id=ev.event_id,
                 camera_id=ev.camera_id,
@@ -204,11 +268,18 @@ class TimelineBuilder:
                 visual_category=category,
                 matched_with_camera=matched_cam,
                 matched_event_id=matched_evt,
-                confidence=round(conf, 3),
+                confidence=conf_val,
                 review_status=rev_status,
                 uncertainty_sec=unc,
                 thumbnail_path=ev.thumbnail_path,
-                notes=ev.notes
+                notes=ev.notes,
+                data_classification=classification,
+                calibration_method=calib_method,
+                synchronization_status=sync_status,
+                supporting_anchors=supporting_anchors,
+                override_reason=override_reason_val,
+                audit_ref=audit_ref_val,
+                software_version=SOFTWARE_VERSION
             )
             unified.append(uni_evt)
 
@@ -264,7 +335,8 @@ class TimelineBuilder:
                 ))
             else:
                 fps = meta.nominal_fps if meta.nominal_fps > 0 else 30.0
-                frame_idx = min(meta.total_frames - 1, max(0, int(round(src_time * fps))))
+                max_frame = max(0, meta.total_frames - 1) if meta.total_frames > 0 else 0
+                frame_idx = min(max_frame, max(0, int(round(src_time * fps))))
 
                 results.append(SynchronizedCameraLookup(
                     global_timestamp_sec=query_global_sec,
