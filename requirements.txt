@@ -1,11 +1,8 @@
-# ChronoTrace AI: Multi-Camera Forensic Timeline Reconstruction
-# Pinned dependencies for local execution
-
-numpy==2.4.6
+numpy>=1.26.0,<2.0.0
 scipy==1.17.1
-pandas==2.3.3
+pandas>=2.2.0,<3.0.0
 opencv-python-headless>=4.8.0
-scenedetect==0.7.2
+scenedetect-headless==0.7.2
 streamlit==1.66.1
 imageio-ffmpeg==0.6.0
 pytest==9.1.1
